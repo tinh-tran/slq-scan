@@ -1,63 +1,65 @@
 package sqlscan
 
 import (
-	"errors"
+	"database/sql"
+	"encoding/json"
+	"fmt"
 	"reflect"
+
+	"github.com/lib/pq"
 )
 
-var (
-	// ErrDuplicateValue is returned when duplicate values exist in the struct.
-	ErrDuplicateValue = errors.New("sqlkit/marshal: duplicate values")
-)
+var scannerType = reflect.TypeOf((*sql.Scanner)(nil)).Elem()
 
-func (e Encoder) Encode(obj interface{}, fields ...string) ([]string, []interface{}, error) {
-	m := DefaultMapper
-	if e.mapper != nil {
-		m = e.mapper
+// when JSON/JSONB column use jsonScanner, when ARRAY column use pq.Array,
+// otherwise use basicScanner.
+// Because sql.Rows.Scan's builtin logic can't scan nil to int/string,
+// so we always return a sql.Scanner to avoid its builtin logic.
+func scannerOf(dest reflect.Value, column columnType) interface{} {
+	addr := dest.Addr()
+	if scanner, ok := addr.Interface().(sql.Scanner); ok {
+		return scanner
 	}
 
-	v := reflect.ValueOf(obj)
-	if v.Kind() == reflect.Ptr {
-		v = v.Elem()
+	var dbType string
+	if column.ColumnType != nil {
+		dbType = column.ColumnType.DatabaseTypeName()
 	}
-	t := v.Type()
-	tm := m.TypeMap(t)
-
-	values := make([]interface{}, 0, len(tm.Index))
-	names := make([]string, 0, len(tm.Index))
-	for _, field := range tm.Index {
-		if field.Embedded {
-			continue
+	switch dbType {
+	case "JSONB", "JSON":
+		return &jsonScanner{dest}
+	default:
+		if len(dbType) > 0 && dbType[0] == '_' {
+			return pq.Array(addr.Interface())
+		} else {
+			return &basicScanner{dest}
 		}
-		if len(fields) > 0 && !inStr(fields, field.Name) {
-			continue
-		}
-		if inStr(names, field.Name) {
-			if e.unsafe {
-				continue
-			}
-			return nil, nil, ErrDuplicateValue
-		}
-		names = append(names, field.Name)
-		f := v
-		for _, i := range field.Index {
-			f = f.Field(i)
-		}
-		values = append(values, f.Interface())
 	}
-	return names, values, nil
 }
 
-// Marshal runs the default encoder.
-func Marshal(obj interface{}, fields ...string) ([]string, []interface{}, error) {
-	return Encoder{}.Encode(obj, fields...)
+type jsonScanner struct {
+	dest reflect.Value
 }
 
-func inStr(arr []string, val string) bool {
-	for _, item := range arr {
-		if item == val {
-			return true
-		}
+func (js *jsonScanner) Scan(src interface{}) error {
+	switch buf := src.(type) {
+	case nil:
+		// if src is null, should set dest to it's zero value.
+		// eg. when dest is int, should set it to 0.
+		js.dest.Set(reflect.Zero(js.dest.Type()))
+		return nil
+	case []byte:
+		return json.Unmarshal(buf, getJsonDest(js.dest))
+	case string:
+		return json.Unmarshal([]byte(buf), getJsonDest(js.dest))
+	default:
+		return fmt.Errorf("enou jsonScanner unexpected src: %T(%v)", src, src)
 	}
-	return false
+}
+
+func getJsonDest(dest reflect.Value) interface{} {
+	if dest.Kind() == reflect.Interface && !dest.IsNil() {
+		return dest.Elem().Interface()
+	}
+	return dest.Addr().Interface()
 }
